@@ -94,11 +94,10 @@ Only visible lines are processed, and nothing is stored in the buffer. The colou
 
 ## Limits
 
-- Typing a path character outside letters, digits, `_`, `-`, `.`, and `/` closes the menu. Those files can still be found by matching other parts of the name.
+- Typing a path character outside letters, digits, `_`, `-`, `.`, `/`, `+`, `~`, and `$` closes the menu. Those files can still be found by matching other parts of the name.
 - A file deleted in the working tree stays listed until the index next changes.
 - Paths containing spaces are inserted as they are, and an agent may read them as ending at the space.
 - `@path` inside code fences is highlighted too.
-- A split with a different `:lcd` is matched against the current window's working directory.
 
 ## License
 
