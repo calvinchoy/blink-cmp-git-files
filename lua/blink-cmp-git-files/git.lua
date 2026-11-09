@@ -8,28 +8,36 @@ local M = {}
 
 local NOT_A_REPO_RETRY_NS = 30 * 1e9
 
+local LIST_TRACKED = { "git", "ls-files", "-z", "--cached", "--deduplicate" }
+local LIST_DELETED = { "git", "ls-files", "-z", "--deleted" }
+local FIND_INDEX = { "git", "rev-parse", "--path-format=absolute", "--git-path", "index" }
+
+--- An immutable snapshot of the tracked files.
+--- @class blink-cmp-git-files.Listing
+--- @field files string[] Tracked paths relative to the working directory
+--- @field lowered string[] Lowercased `files`, at the same indices
+--- @field tracked table<string, true> `files` as a lookup table
+--- @field raw_tracked string `ls-files --cached` output, used to skip reparsing
+--- @field raw_deleted string `ls-files --deleted` output
+
 --- @class blink-cmp-git-files.Entry
---- @field files? string[] Tracked paths relative to the working directory
---- @field lowered? string[] Lowercased `files`, built on first use
---- @field file_set? table<string, true> `files` as a lookup table, built on first use
+--- @field listing? blink-cmp-git-files.Listing
 --- @field index_path? string Absolute path of the git index
 --- @field mtime_sec? integer
 --- @field mtime_nsec? integer
---- @field raw_tracked? string Last `ls-files` output, used to skip reparsing
---- @field raw_deleted? string
 --- @field refreshing boolean
 --- @field retry_at? integer `hrtime` before which git is not tried again
---- @field waiters fun(entry?: blink-cmp-git-files.Entry)[]
+--- @field waiters fun(listing?: blink-cmp-git-files.Listing)[]
 
 --- @type table<string, blink-cmp-git-files.Entry>
 local entries = {}
 
---- @type fun(cwd: string)[]
+--- @type fun()[]
 local change_listeners = {}
 
-local function notify_changed(cwd)
+local function notify_changed()
 	for _, listener in ipairs(change_listeners) do
-		listener(cwd)
+		listener()
 	end
 end
 
@@ -60,43 +68,62 @@ local function run(cmd, cwd, on_done)
 	end
 end
 
-local function parse(tracked, deleted)
-	local gone
-	if deleted ~= "" then
-		gone = {}
-		for path in deleted:gmatch("[^%z]+") do
-			gone[path] = true
+--- @return blink-cmp-git-files.Listing
+local function parse(raw_tracked, raw_deleted)
+	local gone = {}
+	for path in raw_deleted:gmatch("[^%z]+") do
+		gone[path] = true
+	end
+
+	local files, lowered, tracked, count = {}, {}, {}, 0
+	for path in raw_tracked:gmatch("[^%z]+") do
+		if not gone[path] then
+			count = count + 1
+			files[count] = path
+			lowered[count] = path:lower()
+			tracked[path] = true
 		end
 	end
 
-	local files, count = {}, 0
-	for path in tracked:gmatch("[^%z]+") do
-		if not (gone and gone[path]) then
-			count = count + 1
-			files[count] = path
-		end
-	end
-	return files
+	return {
+		files = files,
+		lowered = lowered,
+		tracked = tracked,
+		raw_tracked = raw_tracked,
+		raw_deleted = raw_deleted,
+	}
 end
 
 local function finish(entry)
 	entry.refreshing = false
 	local waiters = entry.waiters
 	entry.waiters = {}
-	local result = entry.files and entry or nil
 	for _, waiter in ipairs(waiters) do
-		waiter(result)
+		waiter(entry.listing)
 	end
 end
 
-local function fail(entry, cwd)
-	local had_files = entry.files ~= nil
-	entry.files, entry.lowered, entry.file_set, entry.index_path = nil, nil, nil, nil
-	entry.raw_tracked, entry.raw_deleted = nil, nil
+local function fail(entry)
+	local had_listing = entry.listing ~= nil
+	entry.listing, entry.index_path = nil, nil
 	entry.retry_at = vim.uv.hrtime() + NOT_A_REPO_RETRY_NS
 	finish(entry)
-	if had_files then
-		notify_changed(cwd)
+	if had_listing then
+		notify_changed()
+	end
+end
+
+local function store(entry, raw_tracked, raw_deleted)
+	-- Commands like `git status` touch the index without changing the file
+	-- list. Identical output needs no reparse and no redraw.
+	local previous = entry.listing
+	local changed = not previous or previous.raw_tracked ~= raw_tracked or previous.raw_deleted ~= raw_deleted
+	if changed then
+		entry.listing = parse(raw_tracked, raw_deleted)
+	end
+	finish(entry)
+	if changed then
+		notify_changed()
 	end
 end
 
@@ -104,42 +131,18 @@ local function list_files(entry, cwd)
 	-- Read the mtime first: an index written during the listing then counts as
 	-- stale on the next fetch rather than being missed.
 	local sec, nsec = index_mtime(entry.index_path)
-	local tracked, deleted
-	local pending, succeeded = 2, true
 
-	local function on_listed()
-		pending = pending - 1
-		if pending > 0 then
-			return
+	run(LIST_TRACKED, cwd, function(tracked_ok, raw_tracked)
+		if not tracked_ok then
+			return fail(entry)
 		end
-		if not succeeded then
-			return fail(entry, cwd)
-		end
-
-		entry.mtime_sec, entry.mtime_nsec = sec, nsec
-		-- Commands like `git status` touch the index without changing the file
-		-- list. Identical output needs no reparse and keeps derived tables valid.
-		local changed = tracked ~= entry.raw_tracked or deleted ~= entry.raw_deleted
-		if changed then
-			entry.files = parse(tracked, deleted)
-			entry.lowered, entry.file_set = nil, nil
-			entry.raw_tracked, entry.raw_deleted = tracked, deleted
-		end
-		finish(entry)
-		if changed then
-			notify_changed(cwd)
-		end
-	end
-
-	run({ "git", "ls-files", "-z", "--cached", "--deduplicate" }, cwd, function(ok, stdout)
-		succeeded = succeeded and ok
-		tracked = stdout
-		on_listed()
-	end)
-	run({ "git", "ls-files", "-z", "--deleted" }, cwd, function(ok, stdout)
-		succeeded = succeeded and ok
-		deleted = stdout
-		on_listed()
+		run(LIST_DELETED, cwd, function(deleted_ok, raw_deleted)
+			if not deleted_ok then
+				return fail(entry)
+			end
+			entry.mtime_sec, entry.mtime_nsec = sec, nsec
+			store(entry, raw_tracked, raw_deleted)
+		end)
 	end)
 end
 
@@ -152,19 +155,19 @@ local function refresh(entry, cwd)
 	if entry.index_path then
 		return list_files(entry, cwd)
 	end
-	run({ "git", "rev-parse", "--path-format=absolute", "--git-path", "index" }, cwd, function(ok, stdout)
+	run(FIND_INDEX, cwd, function(ok, stdout)
 		if not ok then
-			return fail(entry, cwd)
+			return fail(entry)
 		end
 		entry.index_path = vim.trim(stdout)
 		list_files(entry, cwd)
 	end)
 end
 
---- Calls back with the entry for `cwd`, or nil if it is not a git repository.
---- A cached list is served immediately, even when a refresh has just started.
+--- Calls back with the listing for `cwd`, or nil if it is not a git repository.
+--- A cached listing is served immediately, even when a refresh has just started.
 --- @param cwd string
---- @param callback fun(entry?: blink-cmp-git-files.Entry)
+--- @param callback fun(listing?: blink-cmp-git-files.Listing)
 function M.get(cwd, callback)
 	local entry = entries[cwd]
 	if not entry then
@@ -179,57 +182,29 @@ function M.get(cwd, callback)
 		entry.retry_at = nil
 	end
 
-	if entry.files then
+	if entry.listing then
 		if is_stale(entry) then
 			refresh(entry, cwd)
 		end
-		return callback(entry)
+		return callback(entry.listing)
 	end
 
 	table.insert(entry.waiters, callback)
 	refresh(entry, cwd)
 end
 
---- Returns the cached entry for `cwd` without checking for changes.
+--- Returns the cached listing for `cwd` without checking for changes.
 --- @param cwd string
---- @return blink-cmp-git-files.Entry?
+--- @return blink-cmp-git-files.Listing?
 function M.peek(cwd)
 	local entry = entries[cwd]
-	return entry and entry.files and entry or nil
+	return entry and entry.listing
 end
 
 --- Registers a function called on the main loop when a file list changes.
---- @param listener fun(cwd: string)
+--- @param listener fun()
 function M.on_change(listener)
 	table.insert(change_listeners, listener)
-end
-
---- Tracked paths as a lookup table.
---- @param entry blink-cmp-git-files.Entry
---- @return table<string, true>
-function M.tracked_set(entry)
-	if not entry.file_set then
-		local file_set = {}
-		for _, path in ipairs(entry.files) do
-			file_set[path] = true
-		end
-		entry.file_set = file_set
-	end
-	return entry.file_set
-end
-
---- Lowercased paths for case-insensitive filtering.
---- @param entry blink-cmp-git-files.Entry
---- @return string[]
-function M.lowered(entry)
-	if not entry.lowered then
-		local lowered = {}
-		for i, path in ipairs(entry.files) do
-			lowered[i] = path:lower()
-		end
-		entry.lowered = lowered
-	end
-	return entry.lowered
 end
 
 return M

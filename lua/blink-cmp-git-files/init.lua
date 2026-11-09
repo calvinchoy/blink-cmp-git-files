@@ -7,14 +7,10 @@ local PROVIDER_ID = "git_files"
 local DEFAULT_FILETYPES = { "markdown" }
 local DEFAULT_MAX_CANDIDATES = 5000
 
-local byte = string.byte
-
 --- @class blink-cmp-git-files.Source : blink.cmp.Source
 --- @field max_candidates integer
 --- @field file_kind integer
 local source = {}
-
-source.in_token = token.in_token
 
 --- Adds this source to a provider list. Use it in `sources.default`.
 --- While the cursor is in a `@` token, this source becomes the only provider.
@@ -26,7 +22,7 @@ function source.with_sources(base, filetypes)
 		return base
 	end
 	local col = vim.api.nvim_win_get_cursor(0)[2]
-	if source.in_token(vim.api.nvim_get_current_line(), col) then
+	if token.find_start(vim.api.nvim_get_current_line(), col) then
 		return { PROVIDER_ID }
 	end
 	local providers = vim.list_extend({}, base)
@@ -57,71 +53,61 @@ function source:get_trigger_characters()
 	return { "@", "/", "." }
 end
 
+local function empty_response()
+	return { is_incomplete_forward = false, is_incomplete_backward = false, items = {} }
+end
+
+--- Returns the index following the first `prefix` in `path`, or nil if absent.
+local function after_prefix(path, prefix)
+	if prefix == "" then
+		return 1
+	end
+	local _, prefix_end = path:find(prefix, 1, true)
+	return prefix_end and prefix_end + 1
+end
+
 --- True if the bytes of `needle` appear in order in `haystack` from `start`.
-local function is_subsequence(needle, needle_length, haystack, start)
+local function is_subsequence(needle, haystack, start)
 	local matched = 1
-	local wanted = byte(needle, matched)
 	for i = start, #haystack do
-		if byte(haystack, i) == wanted then
-			matched = matched + 1
-			if matched > needle_length then
+		if haystack:byte(i) == needle:byte(matched) then
+			if matched == #needle then
 				return true
 			end
-			wanted = byte(needle, matched)
+			matched = matched + 1
 		end
 	end
 	return false
 end
 
---- @param entry blink-cmp-git-files.Entry
+--- @param listing blink-cmp-git-files.Listing
 --- @param query string Text between the `@` and the cursor
 --- @param range lsp.Range
 --- @return blink.cmp.CompletionResponse
-function source:build_response(entry, query, range)
-	local files = entry.files
-	local max_candidates = self.max_candidates
-	local file_kind = self.file_kind
-
+function source:build_response(listing, query, range)
 	-- Blink only fuzzy-matches the text after the last `/` or `.`, so anything
 	-- before it has to be matched here.
 	local prefix = (query:match("^(.*[/.])") or ""):lower()
-	local prefix_length = #prefix
-	local keyword = query:sub(prefix_length + 1):lower()
-	local keyword_length = #keyword
+	local keyword = query:sub(#prefix + 1):lower()
 
 	-- Small lists go to blink whole and are filtered there without another
 	-- fetch. Past the cap, the keyword has to narrow the list here instead.
-	local is_large = #files > max_candidates
-	local filter_keyword = is_large and keyword_length > 0
-	local lowered = (prefix_length > 0 or filter_keyword) and git.lowered(entry) or nil
+	local filter_keyword = #listing.files > self.max_candidates and keyword ~= ""
 
-	local items, count, truncated = {}, 0, false
-	for i, path in ipairs(files) do
-		local remainder_start = 1
-		local matches = true
+	local items, truncated = {}, false
+	for i, path in ipairs(listing.files) do
+		local lowered = listing.lowered[i]
+		local remainder = after_prefix(lowered, prefix)
 
-		if prefix_length > 0 then
-			local _, prefix_end = lowered[i]:find(prefix, 1, true)
-			if prefix_end then
-				remainder_start = prefix_end + 1
-			else
-				matches = false
-			end
-		end
-		if matches and filter_keyword then
-			matches = is_subsequence(keyword, keyword_length, lowered[i], remainder_start)
-		end
-
-		if matches then
-			if count == max_candidates then
+		if remainder and (not filter_keyword or is_subsequence(keyword, lowered, remainder)) then
+			if #items >= self.max_candidates then
 				truncated = true
 				break
 			end
-			count = count + 1
-			items[count] = {
+			items[#items + 1] = {
 				label = path,
-				kind = file_kind,
-				filterText = remainder_start > 1 and path:sub(remainder_start) or nil,
+				kind = self.file_kind,
+				filterText = remainder > 1 and path:sub(remainder) or nil,
 				-- Shared between items: blink copies an edit before changing it
 				textEdit = { newText = path, range = range },
 			}
@@ -137,10 +123,9 @@ end
 
 function source:get_completions(context, callback)
 	local col = context.cursor[2]
-	local at = source.in_token(context.line, col)
+	local at = token.find_start(context.line, col)
 	if not at then
-		callback({ is_incomplete_forward = false, is_incomplete_backward = false, items = {} })
-		return
+		return callback(empty_response())
 	end
 
 	local query = context.line:sub(at + 1, col)
@@ -150,12 +135,8 @@ function source:get_completions(context, callback)
 		["end"] = { line = line_number, character = col },
 	}
 
-	git.get(vim.fn.getcwd(), function(entry)
-		if not entry then
-			callback({ is_incomplete_forward = false, is_incomplete_backward = false, items = {} })
-			return
-		end
-		callback(self:build_response(entry, query, range))
+	git.get(vim.fn.getcwd(), function(listing)
+		callback(listing and self:build_response(listing, query, range) or empty_response())
 	end)
 end
 

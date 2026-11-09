@@ -13,8 +13,7 @@ local GROUP = "BlinkCmpGitFilesPath"
 local PRIORITY = 4200
 
 local filetypes = {}
-local current_cwd
-local active_entry
+local active_listing
 local installed = false
 
 local function define_highlight()
@@ -24,13 +23,21 @@ end
 --- Checks whether the tracked files changed. Costs one `fs_stat` once loaded.
 local function check_for_changes()
 	if filetypes[vim.bo.filetype] then
-		current_cwd = vim.fn.getcwd()
-		git.get(current_cwd, function() end)
+		git.get(vim.fn.getcwd(), function() end)
 	end
 end
 
 local function redraw()
 	vim.api.nvim__redraw({ valid = false, flush = true })
+end
+
+--- `getcwd(win)` ignores 'autochdir', so the current window has to use the
+--- plain form to share its cache entry with `check_for_changes` and completion.
+local function window_cwd(win)
+	if win == vim.api.nvim_get_current_win() then
+		return vim.fn.getcwd()
+	end
+	return vim.fn.getcwd(win)
 end
 
 local function install(namespace)
@@ -43,30 +50,22 @@ local function install(namespace)
 		callback = check_for_changes,
 	})
 
-	git.on_change(function(cwd)
-		if cwd == current_cwd then
-			redraw()
-		end
-	end)
+	git.on_change(redraw)
 
 	vim.api.nvim_set_decoration_provider(namespace, {
-		on_win = function(_, _, buf)
-			if not filetypes[vim.bo[buf].filetype] or not current_cwd then
+		on_win = function(_, win, buf)
+			if not filetypes[vim.bo[buf].filetype] then
 				return false
 			end
-			active_entry = git.peek(current_cwd)
-			return active_entry ~= nil
+			active_listing = git.peek(window_cwd(win))
+			return active_listing ~= nil
 		end,
 		on_line = function(_, _, buf, row)
 			local line = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
-			if not line or not line:find("@", 1, true) then
+			if not line then
 				return
 			end
-			local ranges = token.file_ranges(line, git.tracked_set(active_entry))
-			if not ranges then
-				return
-			end
-			for _, range in ipairs(ranges) do
+			for _, range in ipairs(token.file_ranges(line, active_listing.tracked)) do
 				vim.api.nvim_buf_set_extmark(buf, namespace, row, range[1], {
 					end_col = range[2],
 					hl_group = GROUP,
